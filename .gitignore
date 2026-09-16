@@ -1,0 +1,7 @@
+# 编译产物
+*.o
+git-gui.exe
+resource.res
+
+# 本机配置（含绝对路径，不入库；使用 git-gui.ini.example 作为模板）
+git-gui.ini
