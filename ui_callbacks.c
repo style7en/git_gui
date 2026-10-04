@@ -99,7 +99,7 @@ static BOOL InputBox(HWND hParent, const TCHAR* prompt, const TCHAR* title, TCHA
         wcex.hInstance = GetModuleHandle(NULL);
         wcex.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
         wcex.lpszClassName = TEXT("GitGUIInputBoxClass");
-        wcex.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+        wcex.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(101));
         wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
         RegisterClassEx(&wcex);
     }
@@ -1021,7 +1021,7 @@ void on_settings_clicked(AppState* state) {
         wcex.hInstance = GetModuleHandle(NULL);
         wcex.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
         wcex.lpszClassName = TEXT("GitGUISettingsClass");
-        wcex.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+        wcex.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(101));
         wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
         RegisterClassEx(&wcex);
     }

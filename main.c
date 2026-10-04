@@ -533,12 +533,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wcex.cbClsExtra = 0;
     wcex.cbWndExtra = 0;
     wcex.hInstance = hInstance;
-    wcex.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(101));
     wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
     wcex.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wcex.lpszMenuName = NULL;
     wcex.lpszClassName = TEXT("GitGUIClass");
-    wcex.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
+    wcex.hIconSm = (HICON)LoadImage(hInstance, MAKEINTRESOURCE(101), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
 
     if (!RegisterClassEx(&wcex)) {
         MessageBox(NULL, TEXT("窗口类注册失败"), TEXT("错误"), MB_ICONERROR);

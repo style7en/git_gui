@@ -2,6 +2,7 @@
 # 使用 MinGW-w64 GCC 编译
 
 CC = gcc
+WINDRES = windres
 CFLAGS = -Wall -Os -flto -fdata-sections -ffunction-sections -DUNICODE -D_UNICODE -D__USE_MINGW_SECURE_API
 LDFLAGS = -mwindows -s -flto -Wl,--gc-sections -lcomctl32 -lcomdlg32 -lshell32 -lole32 -luuid
 
@@ -16,21 +17,25 @@ TARGET = git-gui.exe
 all: $(TARGET)
 
 # 编译目标
-$(TARGET): $(OBJS)
-	$(CC) -o $@ $(OBJS) $(LDFLAGS)
+$(TARGET): $(OBJS) icon.res
+	$(CC) -o $@ $(OBJS) icon.res $(LDFLAGS)
 
 # 编译 C 文件
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# 编译资源文件
+icon.res: icon.rc git-gui.ico
+	$(WINDRES) -i $< -o $@ -O coff
+
 # 清理
 clean:
-	del /Q *.o $(TARGET) 2>nul
+	-$(DEL) *.o $(TARGET) icon.res 2>nul || true
 
 # 重新编译
 rebuild: clean all
 
-# 运行 
+# 运行
 run: $(TARGET)
 	./$(TARGET)
 
