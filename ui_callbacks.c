@@ -15,14 +15,21 @@ void config_save(AppState* state);
 void config_save_repo(AppState* state);
 
 // 临时文件管理
-#define MAX_TEMP_FILES 64
+#define MAX_TEMP_FILES 256
 static TCHAR g_tempFiles[MAX_TEMP_FILES][MAX_PATH_LEN];
 static int g_tempFileCount = 0;
 
 static void register_temp_file(const TCHAR* path) {
+    // 去重，避免同一文件被重复登记
+    for (int i = 0; i < g_tempFileCount; i++) {
+        if (_tcscmp(g_tempFiles[i], path) == 0) return;
+    }
     if (g_tempFileCount < MAX_TEMP_FILES) {
         _tcsncpy_s(g_tempFiles[g_tempFileCount], MAX_PATH_LEN, path, _TRUNCATE);
         g_tempFileCount++;
+    } else {
+        // 容量已满：立即删除该临时文件，避免在 %TEMP% 中泄漏
+        DeleteFile(path);
     }
 }
 
@@ -31,6 +38,63 @@ static void cleanup_temp_files(void) {
         DeleteFile(g_tempFiles[i]);
     }
     g_tempFileCount = 0;
+}
+
+// 获取列表控件当前选中项关联的 lParam（无选中返回 0）
+static LPARAM get_selected_lparam(HWND hList) {
+    int idx = ListView_GetNextItem(hList, -1, LVNI_SELECTED);
+    if (idx == -1) return 0;
+
+    LVITEM lvi;
+    memset(&lvi, 0, sizeof(lvi));
+    lvi.mask = LVIF_PARAM;
+    lvi.iItem = idx;
+    if (!ListView_GetItem(hList, &lvi)) return 0;
+    return lvi.lParam;
+}
+
+// 将 UTF-8 内容写入指定文件；成功返回 TRUE
+static BOOL write_file_utf8(const TCHAR* path, const char* content) {
+    HANDLE hFile = CreateFile(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return FALSE;
+
+    DWORD written;
+    BOOL ok = WriteFile(hFile, content, (DWORD)strlen(content), &written, NULL);
+    CloseHandle(hFile);
+    return ok;
+}
+
+// 使用 Beyond Compare 比较 1~3 个文件；成功启动返回 TRUE
+static BOOL launch_compare(AppState* state, const TCHAR* f1, const TCHAR* f2, const TCHAR* f3) {
+    TCHAR bcomparePath[MAX_PATH_LEN];
+    TCHAR cmdLine[MAX_CMD_LEN * 2];
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+
+    utf8_to_wide(state->bcompare_path, bcomparePath, MAX_PATH_LEN);
+
+    if (f3) {
+        _sntprintf_s(cmdLine, MAX_CMD_LEN * 2, _TRUNCATE,
+            TEXT("\"%s\" \"%s\" \"%s\" \"%s\""), bcomparePath, f1, f2, f3);
+    } else if (f2) {
+        _sntprintf_s(cmdLine, MAX_CMD_LEN * 2, _TRUNCATE,
+            TEXT("\"%s\" \"%s\" \"%s\""), bcomparePath, f1, f2);
+    } else {
+        _sntprintf_s(cmdLine, MAX_CMD_LEN * 2, _TRUNCATE,
+            TEXT("\"%s\" \"%s\""), bcomparePath, f1);
+    }
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (!CreateProcess(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        return FALSE;
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return TRUE;
 }
 
 typedef struct InputBoxCtx {
@@ -83,7 +147,7 @@ static LRESULT CALLBACK InputBoxWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             DestroyWindow(hWnd);
             break;
         case WM_DESTROY:
-            if (ctx && ctx->hFont) DeleteObject(ctx->hFont);
+            // 注意：ctx->hFont 为全局共享字体（CreateUIFont 管理），此处不得删除
             break;
         default:
             return DefWindowProc(hWnd, msg, wParam, lParam);
@@ -99,7 +163,7 @@ static BOOL InputBox(HWND hParent, const TCHAR* prompt, const TCHAR* title, TCHA
         wcex.hInstance = GetModuleHandle(NULL);
         wcex.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
         wcex.lpszClassName = TEXT("GitGUIInputBoxClass");
-        wcex.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(101));
+        wcex.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_APPICON));
         wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
         RegisterClassEx(&wcex);
     }
@@ -179,6 +243,21 @@ void clear_output(AppState* state) {
     }
 }
 
+// 将 UTF-8 文本追加到输出框（自动转换为宽字符）
+static void append_output_utf8(AppState* state, const char* utf8) {
+    if (!utf8 || !utf8[0]) return;
+
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (wlen <= 0) return;
+
+    TCHAR* wbuf = (TCHAR*)malloc((size_t)wlen * sizeof(TCHAR));
+    if (!wbuf) return;
+
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wbuf, wlen);
+    append_output(state, wbuf);
+    free(wbuf);
+}
+
 static void get_status_text(FileStatus status, TCHAR* buf, int size) {
     switch (status) {
         case FILE_STATUS_MODIFIED:  _tcscpy_s(buf, size, TEXT("已修改")); break;
@@ -192,16 +271,6 @@ static void get_status_text(FileStatus status, TCHAR* buf, int size) {
 
 void refresh_file_list(AppState* state) {
     if (!state->hFileList) return;
-
-    // 先清除 ListView 中所有项的 lParam，避免悬空指针
-    int itemCount = ListView_GetItemCount(state->hFileList);
-    for (int i = 0; i < itemCount; i++) {
-        LVITEM lvi;
-        lvi.mask = LVIF_PARAM;
-        lvi.iItem = i;
-        lvi.lParam = 0;
-        ListView_SetItem(state->hFileList, &lvi);
-    }
 
     ListView_DeleteAllItems(state->hFileList);
 
@@ -249,16 +318,6 @@ void refresh_file_list(AppState* state) {
 
 void refresh_log_list(AppState* state) {
     if (!state->hLogList) return;
-
-    // 先清除 ListView 中所有项的 lParam，避免悬空指针
-    int itemCount = ListView_GetItemCount(state->hLogList);
-    for (int i = 0; i < itemCount; i++) {
-        LVITEM lvi;
-        lvi.mask = LVIF_PARAM;
-        lvi.iItem = i;
-        lvi.lParam = 0;
-        ListView_SetItem(state->hLogList, &lvi);
-    }
 
     ListView_DeleteAllItems(state->hLogList);
 
@@ -375,19 +434,15 @@ void on_commit_clicked(AppState* state) {
 }
 
 void on_push_clicked(AppState* state) {
-    char output[65536];
-    TCHAR woutput[65536];
-
-    memset(output, 0, sizeof(output));
-    memset(woutput, 0, sizeof(woutput));
+    char* output = (char*)malloc(65536);
+    if (!output) return;
+    output[0] = '\0';
 
     append_output_line(state, TEXT("[执行] git push..."));
-    int result = git_push(state->repo_path, output, sizeof(output));
+    int result = git_push(state->repo_path, output, 65536);
 
-    if (strlen(output) > 0) {
-        utf8_to_wide(output, woutput, sizeof(woutput) / sizeof(TCHAR));
-        append_output(state, woutput);
-    }
+    append_output_utf8(state, output);
+    free(output);
 
     if (result == 0) {
         append_output_line(state, TEXT("[成功] 推送成功"));
@@ -399,19 +454,15 @@ void on_push_clicked(AppState* state) {
 }
 
 void on_pull_clicked(AppState* state) {
-    char output[65536];
-    TCHAR woutput[65536];
-
-    memset(output, 0, sizeof(output));
-    memset(woutput, 0, sizeof(woutput));
+    char* output = (char*)malloc(65536);
+    if (!output) return;
+    output[0] = '\0';
 
     append_output_line(state, TEXT("[执行] git pull..."));
-    int result = git_pull(state->repo_path, output, sizeof(output));
+    int result = git_pull(state->repo_path, output, 65536);
 
-    if (strlen(output) > 0) {
-        utf8_to_wide(output, woutput, sizeof(woutput) / sizeof(TCHAR));
-        append_output(state, woutput);
-    }
+    append_output_utf8(state, output);
+    free(output);
 
     if (result == 0) {
         append_output_line(state, TEXT("[成功] 拉取成功"));
@@ -431,34 +482,23 @@ void on_refresh_clicked(AppState* state) {
 void on_stage_clicked(AppState* state) {
     if (!state->hFileList) return;
 
-    int selectedIndex = ListView_GetNextItem(state->hFileList, -1, LVNI_SELECTED);
-
-    if (selectedIndex == -1) {
+    FileInfo* info = (FileInfo*)get_selected_lparam(state->hFileList);
+    if (!info) {
         append_output_line(state, TEXT("[警告] 请先选择要暂存的文件"));
         return;
     }
 
-    LVITEM lvi;
-    memset(&lvi, 0, sizeof(lvi));
-    lvi.mask = LVIF_PARAM;
-    lvi.iItem = selectedIndex;
-    ListView_GetItem(state->hFileList, &lvi);
+    TCHAR wpath[MAX_PATH_LEN];
+    utf8_to_wide(info->path, wpath, MAX_PATH_LEN);
+    TCHAR msg[MAX_PATH_LEN + 50];
+    _sntprintf_s(msg, MAX_PATH_LEN + 50, _TRUNCATE, TEXT("[执行] git add \"%s\""), wpath);
+    append_output_line(state, msg);
 
-    FileInfo* info = (FileInfo*)lvi.lParam;
-    if (info) {
-        TCHAR wpath[MAX_PATH_LEN];
-        utf8_to_wide(info->path, wpath, MAX_PATH_LEN);
-        TCHAR msg[MAX_PATH_LEN + 50];
-        _sntprintf_s(msg, MAX_PATH_LEN + 50, _TRUNCATE, TEXT("[执行] git add \"%s\""), wpath);
-        append_output_line(state, msg);
-
-        int result = git_add(state->repo_path, info->path);
-        if (result == 0) {
-            append_output_line(state, TEXT("[成功] 暂存成功"));
-            refresh_file_list(state);
-        } else {
-            append_output_line(state, TEXT("[错误] 暂存失败"));
-        }
+    if (git_add(state->repo_path, info->path) == 0) {
+        append_output_line(state, TEXT("[成功] 暂存成功"));
+        refresh_file_list(state);
+    } else {
+        append_output_line(state, TEXT("[错误] 暂存失败"));
     }
 }
 
@@ -576,112 +616,69 @@ void on_tab_changed(AppState* state, int tabIndex) {
 void on_file_double_click(AppState* state) {
     if (!state->hFileList) return;
 
-    int selectedIndex = ListView_GetNextItem(state->hFileList, -1, LVNI_SELECTED);
-    if (selectedIndex == -1) return;
-
-    LVITEM lvi;
-    memset(&lvi, 0, sizeof(lvi));
-    lvi.mask = LVIF_PARAM;
-    lvi.iItem = selectedIndex;
-    ListView_GetItem(state->hFileList, &lvi);
-
-    FileInfo* info = (FileInfo*)lvi.lParam;
+    FileInfo* info = (FileInfo*)get_selected_lparam(state->hFileList);
     if (!info) return;
+
+    if (info->status == FILE_STATUS_UNTRACKED) {
+        MessageBox(state->hMainWnd, TEXT("未跟踪文件没有旧版本可比较"), TEXT("提示"), MB_ICONINFORMATION);
+        return;
+    }
 
     TCHAR tempPath[MAX_PATH_LEN];
     TCHAR tempFileHead[MAX_PATH_LEN];
     TCHAR tempFileStaged[MAX_PATH_LEN];
     TCHAR currentFile[MAX_PATH_LEN];
-    TCHAR bcomparePath[MAX_PATH_LEN];
-    TCHAR cmdLine[MAX_CMD_LEN * 2];
-    
-    utf8_to_wide(state->bcompare_path, bcomparePath, MAX_PATH_LEN);
-    
+    TCHAR wrel[MAX_PATH_LEN];
+
+    // 工作区文件绝对路径：<仓库路径>\<相对路径>
     utf8_to_wide(state->repo_path, tempPath, MAX_PATH_LEN);
-    _sntprintf_s(currentFile, MAX_PATH_LEN, _TRUNCATE, TEXT("%s\\%S"), tempPath, info->path);
-    
+    utf8_to_wide(info->path, wrel, MAX_PATH_LEN);
+    _sntprintf_s(currentFile, MAX_PATH_LEN, _TRUNCATE, TEXT("%s\\%s"), tempPath, wrel);
+
     GetTempPath(MAX_PATH_LEN, tempPath);
     GetTempFileName(tempPath, TEXT("git_head"), 0, tempFileHead);
     GetTempFileName(tempPath, TEXT("git_staged"), 0, tempFileStaged);
 
-    char* headContent = NULL;
-    char* stagedContent = NULL;
     int hasHeadVersion = 0;
     int hasStagedVersion = 0;
+    char* content = NULL;
 
-    if (info->status != FILE_STATUS_UNTRACKED && info->status != FILE_STATUS_ADDED) {
-        headContent = (char*)malloc(MAX_OUTPUT_SIZE);
-        if (headContent) {
-            memset(headContent, 0, MAX_OUTPUT_SIZE);
-            if (git_get_file_head_version(state->repo_path, info->path, headContent, MAX_OUTPUT_SIZE) == 0) {
-                hasHeadVersion = 1;
-                HANDLE hFile = CreateFile(tempFileHead, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (hFile != INVALID_HANDLE_VALUE) {
-                    DWORD written;
-                    WriteFile(hFile, headContent, (DWORD)strlen(headContent), &written, NULL);
-                    CloseHandle(hFile);
-                }
+    // 新增文件没有 HEAD 版本
+    if (info->status != FILE_STATUS_ADDED) {
+        content = (char*)malloc(MAX_OUTPUT_SIZE);
+        if (content) {
+            memset(content, 0, MAX_OUTPUT_SIZE);
+            if (git_get_file_head_version(state->repo_path, info->path, content, MAX_OUTPUT_SIZE) == 0) {
+                hasHeadVersion = write_file_utf8(tempFileHead, content);
             }
-            free(headContent);
+            free(content);
         }
     }
 
-    if (info->staged && info->status != FILE_STATUS_UNTRACKED) {
-        stagedContent = (char*)malloc(MAX_OUTPUT_SIZE);
-        if (stagedContent) {
-            memset(stagedContent, 0, MAX_OUTPUT_SIZE);
-            if (git_get_file_staged_version(state->repo_path, info->path, stagedContent, MAX_OUTPUT_SIZE) == 0) {
-                hasStagedVersion = 1;
-                HANDLE hFile = CreateFile(tempFileStaged, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (hFile != INVALID_HANDLE_VALUE) {
-                    DWORD written;
-                    WriteFile(hFile, stagedContent, (DWORD)strlen(stagedContent), &written, NULL);
-                    CloseHandle(hFile);
-                }
+    if (info->staged) {
+        content = (char*)malloc(MAX_OUTPUT_SIZE);
+        if (content) {
+            memset(content, 0, MAX_OUTPUT_SIZE);
+            if (git_get_file_staged_version(state->repo_path, info->path, content, MAX_OUTPUT_SIZE) == 0) {
+                hasStagedVersion = write_file_utf8(tempFileStaged, content);
             }
-            free(stagedContent);
+            free(content);
         }
     }
 
-    STARTUPINFO si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    ZeroMemory(&pi, sizeof(pi));
-
-    BOOL launched = FALSE;
-
-    if (info->status == FILE_STATUS_UNTRACKED) {
-        MessageBox(state->hMainWnd, TEXT("未跟踪文件没有旧版本可比较"), TEXT("提示"), MB_ICONINFORMATION);
-        DeleteFile(tempFileHead);
-        DeleteFile(tempFileStaged);
-        return;
-    }
-    
+    // 选择“旧版本”：已暂存文件与暂存版本比较，其余与 HEAD 比较
+    const TCHAR* oldFile = NULL;
     if (info->status == FILE_STATUS_DELETED) {
-        if (hasHeadVersion) {
-            _sntprintf_s(cmdLine, MAX_CMD_LEN * 2, _TRUNCATE, 
-                TEXT("\"%s\" \"%s\" \"%s\""), bcomparePath, tempFileHead, currentFile);
-            launched = CreateProcess(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
-        }
+        if (hasHeadVersion) oldFile = tempFileHead;
     } else if (info->staged && hasStagedVersion) {
-        if (hasHeadVersion) {
-            _sntprintf_s(cmdLine, MAX_CMD_LEN * 2, _TRUNCATE, 
-                TEXT("\"%s\" \"%s\" \"%s\""), bcomparePath, tempFileStaged, currentFile);
-            launched = CreateProcess(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
-        }
+        oldFile = tempFileStaged;
     } else if (hasHeadVersion) {
-        _sntprintf_s(cmdLine, MAX_CMD_LEN * 2, _TRUNCATE, 
-            TEXT("\"%s\" \"%s\" \"%s\""), bcomparePath, tempFileHead, currentFile);
-        launched = CreateProcess(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
+        oldFile = tempFileHead;
     }
 
-    if (launched) {
-        // 注册临时文件，程序退出时清理
+    if (oldFile && launch_compare(state, oldFile, currentFile, NULL)) {
         register_temp_file(tempFileHead);
         register_temp_file(tempFileStaged);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
     } else {
         MessageBox(state->hMainWnd, TEXT("无法启动 Beyond Compare 或没有可比较的版本"), TEXT("错误"), MB_ICONERROR);
         DeleteFile(tempFileHead);
@@ -689,44 +686,17 @@ void on_file_double_click(AppState* state) {
     }
 }
 
-void on_log_double_click(AppState* state) {
-    if (!state->hLogList) return;
+static void populate_commit_file_list(AppState* state, const char* commit_hash) {
+    if (!state->hCommitFileList) return;
 
-    int selectedIndex = ListView_GetNextItem(state->hLogList, -1, LVNI_SELECTED);
-    if (selectedIndex == -1) return;
-
-    LVITEM lvi;
-    memset(&lvi, 0, sizeof(lvi));
-    lvi.mask = LVIF_PARAM;
-    lvi.iItem = selectedIndex;
-    ListView_GetItem(state->hLogList, &lvi);
-
-    CommitInfo* info = (CommitInfo*)lvi.lParam;
-    if (!info) return;
-
-    strncpy(state->selected_commit_hash, info->hash, sizeof(state->selected_commit_hash) - 1);
-    state->selected_commit_hash[sizeof(state->selected_commit_hash) - 1] = '\0';
-
-    if (state->hCommitFileList) {
-        // 先清除 lParam，避免悬空指针
-        int itemCount = ListView_GetItemCount(state->hCommitFileList);
-        for (int i = 0; i < itemCount; i++) {
-            LVITEM lvi2;
-            lvi2.mask = LVIF_PARAM;
-            lvi2.iItem = i;
-            lvi2.lParam = 0;
-            ListView_SetItem(state->hCommitFileList, &lvi2);
-        }
-        ListView_DeleteAllItems(state->hCommitFileList);
-    }
+    ListView_DeleteAllItems(state->hCommitFileList);
 
     if (state->commit_file_list) {
         git_free_commit_file_list(state->commit_file_list);
         state->commit_file_list = NULL;
     }
 
-    state->commit_file_list = git_get_commit_files(state->repo_path, info->hash);
-    ShowWindow(state->hCommitFileList, SW_SHOW);
+    state->commit_file_list = git_get_commit_files(state->repo_path, commit_hash);
 
     CommitFileInfo* fileInfo = state->commit_file_list;
     int index = 0;
@@ -737,18 +707,18 @@ void on_log_double_click(AppState* state) {
         utf8_to_wide(fileInfo->path, wpath, MAX_PATH_LEN);
         utf8_to_wide(fileInfo->status, wstatus, 16);
 
-        LVITEM lvi2;
-        memset(&lvi2, 0, sizeof(lvi2));
-        lvi2.mask = LVIF_TEXT | LVIF_PARAM;
-        lvi2.iItem = index;
-        lvi2.lParam = (LPARAM)fileInfo;
-        lvi2.pszText = wpath;
-        ListView_InsertItem(state->hCommitFileList, &lvi2);
+        LVITEM lvi;
+        memset(&lvi, 0, sizeof(lvi));
+        lvi.mask = LVIF_TEXT | LVIF_PARAM;
+        lvi.iItem = index;
+        lvi.lParam = (LPARAM)fileInfo;
+        lvi.pszText = wpath;
+        ListView_InsertItem(state->hCommitFileList, &lvi);
 
-        lvi2.mask = LVIF_TEXT;
-        lvi2.iSubItem = 1;
-        lvi2.pszText = wstatus;
-        ListView_SetItem(state->hCommitFileList, &lvi2);
+        lvi.mask = LVIF_TEXT;
+        lvi.iSubItem = 1;
+        lvi.pszText = wstatus;
+        ListView_SetItem(state->hCommitFileList, &lvi);
 
         fileInfo = fileInfo->next;
         index++;
@@ -758,104 +728,77 @@ void on_log_double_click(AppState* state) {
     ListView_SetColumnWidth(state->hCommitFileList, 1, 60);
 }
 
+void on_log_double_click(AppState* state) {
+    if (!state->hLogList) return;
+
+    CommitInfo* info = (CommitInfo*)get_selected_lparam(state->hLogList);
+    if (!info) return;
+
+    strncpy(state->selected_commit_hash, info->hash, sizeof(state->selected_commit_hash) - 1);
+    state->selected_commit_hash[sizeof(state->selected_commit_hash) - 1] = '\0';
+
+    populate_commit_file_list(state, info->hash);
+
+    if (state->hCommitFileList) {
+        ShowWindow(state->hCommitFileList, SW_SHOW);
+    }
+}
+
 void on_commit_file_double_click(AppState* state) {
     if (!state->hCommitFileList || !state->selected_commit_hash[0]) return;
 
-    int selectedIndex = ListView_GetNextItem(state->hCommitFileList, -1, LVNI_SELECTED);
-    if (selectedIndex == -1) return;
-
-    LVITEM lvi;
-    memset(&lvi, 0, sizeof(lvi));
-    lvi.mask = LVIF_PARAM;
-    lvi.iItem = selectedIndex;
-    ListView_GetItem(state->hCommitFileList, &lvi);
-
-    CommitFileInfo* info = (CommitFileInfo*)lvi.lParam;
+    CommitFileInfo* info = (CommitFileInfo*)get_selected_lparam(state->hCommitFileList);
     if (!info) return;
 
     TCHAR tempPath[MAX_PATH_LEN];
     TCHAR tempFileOld[MAX_PATH_LEN];
     TCHAR tempFileNew[MAX_PATH_LEN];
-    TCHAR bcomparePath[MAX_PATH_LEN];
-    TCHAR cmdLine[MAX_CMD_LEN * 2];
-
-    utf8_to_wide(state->bcompare_path, bcomparePath, MAX_PATH_LEN);
 
     GetTempPath(MAX_PATH_LEN, tempPath);
     GetTempFileName(tempPath, TEXT("git_old"), 0, tempFileOld);
     GetTempFileName(tempPath, TEXT("git_new"), 0, tempFileNew);
 
-    char* oldContent = (char*)malloc(MAX_OUTPUT_SIZE);
-    char* newContent = (char*)malloc(MAX_OUTPUT_SIZE);
-
     int hasOldVersion = 0;
     int hasNewVersion = 0;
+    char* content = NULL;
 
-    char prevHash[32];
+    char prevHash[64];
     snprintf(prevHash, sizeof(prevHash), "%s^", state->selected_commit_hash);
 
-    if (oldContent) {
-        memset(oldContent, 0, MAX_OUTPUT_SIZE);
-        if (git_get_file_version(state->repo_path, prevHash, info->path, oldContent, MAX_OUTPUT_SIZE) == 0) {
-            hasOldVersion = 1;
-            HANDLE hFile = CreateFile(tempFileOld, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hFile != INVALID_HANDLE_VALUE) {
-                DWORD written;
-                WriteFile(hFile, oldContent, (DWORD)strlen(oldContent), &written, NULL);
-                CloseHandle(hFile);
-            }
+    content = (char*)malloc(MAX_OUTPUT_SIZE);
+    if (content) {
+        memset(content, 0, MAX_OUTPUT_SIZE);
+        if (git_get_file_version(state->repo_path, prevHash, info->path, content, MAX_OUTPUT_SIZE) == 0) {
+            hasOldVersion = write_file_utf8(tempFileOld, content);
         }
-        free(oldContent);
+        free(content);
     }
 
-    if (newContent && strcmp(info->status, "D") != 0) {
-        memset(newContent, 0, MAX_OUTPUT_SIZE);
-        if (git_get_file_version(state->repo_path, state->selected_commit_hash, info->path, newContent, MAX_OUTPUT_SIZE) == 0) {
-            hasNewVersion = 1;
-            HANDLE hFile = CreateFile(tempFileNew, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hFile != INVALID_HANDLE_VALUE) {
-                DWORD written;
-                WriteFile(hFile, newContent, (DWORD)strlen(newContent), &written, NULL);
-                CloseHandle(hFile);
+    // 删除类型的提交文件没有新版本内容
+    if (strcmp(info->status, "D") != 0) {
+        content = (char*)malloc(MAX_OUTPUT_SIZE);
+        if (content) {
+            memset(content, 0, MAX_OUTPUT_SIZE);
+            if (git_get_file_version(state->repo_path, state->selected_commit_hash, info->path, content, MAX_OUTPUT_SIZE) == 0) {
+                hasNewVersion = write_file_utf8(tempFileNew, content);
             }
+            free(content);
         }
-        free(newContent);
     }
-
-    STARTUPINFO si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    ZeroMemory(&pi, sizeof(pi));
 
     BOOL launched = FALSE;
 
     if (strcmp(info->status, "A") == 0) {
-        if (hasNewVersion) {
-            _sntprintf_s(cmdLine, MAX_CMD_LEN * 2, _TRUNCATE,
-                TEXT("\"%s\" \"%s\""), bcomparePath, tempFileNew);
-            launched = CreateProcess(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
-        }
+        if (hasNewVersion) launched = launch_compare(state, tempFileNew, NULL, NULL);
     } else if (strcmp(info->status, "D") == 0) {
-        if (hasOldVersion) {
-            _sntprintf_s(cmdLine, MAX_CMD_LEN * 2, _TRUNCATE,
-                TEXT("\"%s\" \"%s\""), bcomparePath, tempFileOld);
-            launched = CreateProcess(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
-        }
+        if (hasOldVersion) launched = launch_compare(state, tempFileOld, NULL, NULL);
     } else {
-        if (hasOldVersion && hasNewVersion) {
-            _sntprintf_s(cmdLine, MAX_CMD_LEN * 2, _TRUNCATE,
-                TEXT("\"%s\" \"%s\" \"%s\""), bcomparePath, tempFileOld, tempFileNew);
-            launched = CreateProcess(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
-        }
+        if (hasOldVersion && hasNewVersion) launched = launch_compare(state, tempFileOld, tempFileNew, NULL);
     }
 
     if (launched) {
-        // 注册临时文件，程序退出时清理
         register_temp_file(tempFileOld);
         register_temp_file(tempFileNew);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
     } else {
         MessageBox(state->hMainWnd, TEXT("无法启动 Beyond Compare"), TEXT("错误"), MB_ICONERROR);
         DeleteFile(tempFileOld);
@@ -863,32 +806,45 @@ void on_commit_file_double_click(AppState* state) {
     }
 }
 
-static char g_ini_path[MAX_PATH_LEN];
+static WCHAR g_ini_path[MAX_PATH_LEN];
 
 static void get_ini_path(void) {
-    GetModuleFileNameA(NULL, g_ini_path, MAX_PATH_LEN);
-    char* ext = strrchr(g_ini_path, '.');
-    if (ext) *ext = '\0';
-    strcat(g_ini_path, ".ini");
+    GetModuleFileNameW(NULL, g_ini_path, MAX_PATH_LEN);
+    WCHAR* ext = wcsrchr(g_ini_path, L'.');
+    if (ext) *ext = L'\0';
+    wcscat(g_ini_path, L".ini");
+}
+
+// 读取配置项（ini 内部使用宽字符，与 state 中的 UTF-8 互转，保证中文路径正确）
+static void ini_get(const WCHAR* key, const WCHAR* def, char* out, int outSize) {
+    WCHAR wbuf[MAX_PATH_LEN];
+    GetPrivateProfileStringW(L"Settings", key, def, wbuf, MAX_PATH_LEN, g_ini_path);
+    wide_to_utf8(wbuf, out, outSize);
+}
+
+static void ini_put(const WCHAR* key, const char* value) {
+    WCHAR wbuf[MAX_PATH_LEN];
+    utf8_to_wide(value, wbuf, MAX_PATH_LEN);
+    WritePrivateProfileStringW(L"Settings", key, wbuf, g_ini_path);
 }
 
 void config_load(AppState* state) {
     get_ini_path();
-    GetPrivateProfileStringA("Settings", "GitPath", "git.exe", state->git_path, MAX_PATH_LEN, g_ini_path);
-    GetPrivateProfileStringA("Settings", "BComparePath", "", state->bcompare_path, MAX_PATH_LEN, g_ini_path);
-    GetPrivateProfileStringA("Settings", "LastRepo", ".", state->repo_path, MAX_PATH_LEN, g_ini_path);
+    ini_get(L"GitPath", L"git.exe", state->git_path, MAX_PATH_LEN);
+    ini_get(L"BComparePath", L"", state->bcompare_path, MAX_PATH_LEN);
+    ini_get(L"LastRepo", L".", state->repo_path, MAX_PATH_LEN);
 }
 
 void config_save(AppState* state) {
     get_ini_path();
-    WritePrivateProfileStringA("Settings", "GitPath", state->git_path, g_ini_path);
-    WritePrivateProfileStringA("Settings", "BComparePath", state->bcompare_path, g_ini_path);
-    WritePrivateProfileStringA("Settings", "LastRepo", state->repo_path, g_ini_path);
+    ini_put(L"GitPath", state->git_path);
+    ini_put(L"BComparePath", state->bcompare_path);
+    ini_put(L"LastRepo", state->repo_path);
 }
 
 void config_save_repo(AppState* state) {
     get_ini_path();
-    WritePrivateProfileStringA("Settings", "LastRepo", state->repo_path, g_ini_path);
+    ini_put(L"LastRepo", state->repo_path);
 }
 
 typedef struct SettingsCtx {
@@ -907,13 +863,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT message, WPARAM wParam, 
             ctx = (SettingsCtx*)cs->lpCreateParams;
             SetWindowLongPtr(hWnd, GWLP_USERDATA, (LONG_PTR)ctx);
             ctx->hDlg = hWnd;
-            ctx->hFont = CreateFont(
-                -MulDiv(9, GetDeviceCaps(GetDC(NULL), LOGPIXELSY), 72),
-                0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                TEXT("Microsoft YaHei")
-            );
+            ctx->hFont = CreateUIFont();
             int y = 15;
             CreateWindowEx(0, TEXT("STATIC"), TEXT("Git 路径:"),
                 WS_CHILD | WS_VISIBLE, 15, y, 60, 20, hWnd, NULL, NULL, NULL);
@@ -1001,7 +951,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT message, WPARAM wParam, 
             }
             break;
         case WM_DESTROY:
-            if (ctx && ctx->hFont) DeleteObject(ctx->hFont);
+            // hFont 为全局共享字体（CreateUIFont 管理），此处不得删除
             if (ctx) free(ctx);
             break;
         case WM_CLOSE:
@@ -1021,11 +971,12 @@ void on_settings_clicked(AppState* state) {
         wcex.hInstance = GetModuleHandle(NULL);
         wcex.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
         wcex.lpszClassName = TEXT("GitGUISettingsClass");
-        wcex.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(101));
+        wcex.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_APPICON));
         wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
         RegisterClassEx(&wcex);
     }
     SettingsCtx* ctx = (SettingsCtx*)malloc(sizeof(SettingsCtx));
+    if (!ctx) return;
     ctx->state = state;
     ctx->hGitEdit = NULL;
     ctx->hBCompareEdit = NULL;
@@ -1048,16 +999,7 @@ void on_settings_clicked(AppState* state) {
 void on_file_list_context_menu(AppState* state, POINT pt) {
     if (!state->hFileList) return;
 
-    int selectedIndex = ListView_GetNextItem(state->hFileList, -1, LVNI_SELECTED);
-    if (selectedIndex == -1) return;
-
-    LVITEM lvi;
-    memset(&lvi, 0, sizeof(lvi));
-    lvi.mask = LVIF_PARAM;
-    lvi.iItem = selectedIndex;
-    ListView_GetItem(state->hFileList, &lvi);
-
-    FileInfo* info = (FileInfo*)lvi.lParam;
+    FileInfo* info = (FileInfo*)get_selected_lparam(state->hFileList);
     if (!info) return;
 
     HMENU hMenu = CreatePopupMenu();
@@ -1080,9 +1022,6 @@ void on_file_list_context_menu(AppState* state, POINT pt) {
 
     if (cmd == 0) return;
 
-    char cmdLine[MAX_CMD_LEN];
-    char output[MAX_OUTPUT_SIZE];
-
     switch (cmd) {
         case IDM_FILE_VIEW_DIFF:
             on_file_double_click(state);
@@ -1090,9 +1029,8 @@ void on_file_list_context_menu(AppState* state, POINT pt) {
 
         case IDM_FILE_REVERT: {
             if (MessageBox(state->hMainWnd, TEXT("确定要回退该文件的改动吗？"), TEXT("确认回退"), MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                snprintf(cmdLine, MAX_CMD_LEN, "checkout -- \"%s\"", info->path);
                 append_output_line(state, TEXT("[回退] 正在回退文件..."));
-                if (git_execute(state->repo_path, cmdLine, output, MAX_OUTPUT_SIZE) == 0) {
+                if (git_checkout_file(state->repo_path, info->path, NULL, 0) == 0) {
                     append_output_line(state, TEXT("[成功] 文件已回退"));
                     refresh_file_list(state);
                 } else {
@@ -1103,9 +1041,8 @@ void on_file_list_context_menu(AppState* state, POINT pt) {
         }
 
         case IDM_FILE_STAGE: {
-            snprintf(cmdLine, MAX_CMD_LEN, "add \"%s\"", info->path);
             append_output_line(state, TEXT("[暂存] 正在暂存文件..."));
-            if (git_execute(state->repo_path, cmdLine, output, MAX_OUTPUT_SIZE) == 0) {
+            if (git_add(state->repo_path, info->path) == 0) {
                 append_output_line(state, TEXT("[成功] 文件已暂存"));
                 refresh_file_list(state);
             } else {
@@ -1115,9 +1052,8 @@ void on_file_list_context_menu(AppState* state, POINT pt) {
         }
 
         case IDM_FILE_UNSTAGE: {
-            snprintf(cmdLine, MAX_CMD_LEN, "reset HEAD -- \"%s\"", info->path);
             append_output_line(state, TEXT("[取消暂存] 正在取消暂存..."));
-            if (git_execute(state->repo_path, cmdLine, output, MAX_OUTPUT_SIZE) == 0) {
+            if (git_unstage_file(state->repo_path, info->path, NULL, 0) == 0) {
                 append_output_line(state, TEXT("[成功] 已取消暂存"));
                 refresh_file_list(state);
             } else {
@@ -1132,20 +1068,13 @@ void on_file_list_context_menu(AppState* state, POINT pt) {
             utf8_to_wide(info->path, wpath, MAX_PATH_LEN);
             _sntprintf_s(msgW, MAX_PATH_LEN, _TRUNCATE, TEXT("确定要删除文件 \"%s\" 吗？\n此操作不可撤销！"), wpath);
             if (MessageBox(state->hMainWnd, msgW, TEXT("确认删除"), MB_YESNO | MB_ICONWARNING) == IDYES) {
-                char cleanPath[MAX_PATH_LEN];
-                strncpy(cleanPath, info->path, MAX_PATH_LEN - 1);
-                cleanPath[MAX_PATH_LEN - 1] = '\0';
-                int len = (int)strlen(cleanPath);
-                if (len >= 2 && cleanPath[0] == '"' && cleanPath[len - 1] == '"') {
-                    cleanPath[len - 1] = '\0';
-                    memmove(cleanPath, cleanPath + 1, len - 1);
-                }
                 char absPath[MAX_PATH_LEN];
                 char fullPathA[MAX_PATH_LEN];
                 if (GetFullPathNameA(state->repo_path, MAX_PATH_LEN, absPath, NULL) == 0) {
                     strncpy(absPath, state->repo_path, MAX_PATH_LEN - 1);
+                    absPath[MAX_PATH_LEN - 1] = '\0';
                 }
-                snprintf(fullPathA, MAX_PATH_LEN, "%s/%s", absPath, cleanPath);
+                snprintf(fullPathA, MAX_PATH_LEN, "%s/%s", absPath, info->path);
                 TCHAR wfull[MAX_PATH_LEN];
                 utf8_to_wide(fullPathA, wfull, MAX_PATH_LEN);
                 SetFileAttributes(wfull, FILE_ATTRIBUTE_NORMAL);
@@ -1169,16 +1098,7 @@ void on_file_list_context_menu(AppState* state, POINT pt) {
 void on_log_list_context_menu(AppState* state, POINT pt) {
     if (!state->hLogList) return;
 
-    int selectedIndex = ListView_GetNextItem(state->hLogList, -1, LVNI_SELECTED);
-    if (selectedIndex == -1) return;
-
-    LVITEM lvi;
-    memset(&lvi, 0, sizeof(lvi));
-    lvi.mask = LVIF_PARAM;
-    lvi.iItem = selectedIndex;
-    ListView_GetItem(state->hLogList, &lvi);
-
-    CommitInfo* info = (CommitInfo*)lvi.lParam;
+    CommitInfo* info = (CommitInfo*)get_selected_lparam(state->hLogList);
     if (!info) return;
 
     HMENU hMenu = CreatePopupMenu();
@@ -1196,9 +1116,6 @@ void on_log_list_context_menu(AppState* state, POINT pt) {
 
     if (cmd == 0) return;
 
-    char cmdLine[MAX_CMD_LEN];
-    char output[MAX_OUTPUT_SIZE];
-
     switch (cmd) {
         case IDM_LOG_RESET_HARD: {
             TCHAR msg[MAX_PATH_LEN];
@@ -1207,9 +1124,8 @@ void on_log_list_context_menu(AppState* state, POINT pt) {
             _sntprintf_s(msg, MAX_PATH_LEN, _TRUNCATE,
                 TEXT("确定要回退到版本 %s 吗？\n此操作将丢弃之后的所有提交，且不可撤销！"), whash);
             if (MessageBox(state->hMainWnd, msg, TEXT("确认回退"), MB_YESNO | MB_ICONWARNING) == IDYES) {
-                snprintf(cmdLine, MAX_CMD_LEN, "reset --hard %s", info->hash);
                 append_output_line(state, TEXT("[回退] 正在回退到指定版本..."));
-                if (git_execute(state->repo_path, cmdLine, output, MAX_OUTPUT_SIZE) == 0) {
+                if (git_reset_hard(state->repo_path, info->hash, NULL, 0) == 0) {
                     append_output_line(state, TEXT("[成功] 已回退到指定版本"));
                     refresh_file_list(state);
                     refresh_log_list(state);
@@ -1224,10 +1140,9 @@ void on_log_list_context_menu(AppState* state, POINT pt) {
             TCHAR branchName[256];
             if (InputBox(state->hMainWnd, TEXT("输入新分支名称"), TEXT("创建新分支"), branchName, 256)) {
                 char branchA[256];
-                wide_to_utf8(branchName, branchA, 256);
-                snprintf(cmdLine, MAX_CMD_LEN, "checkout -b \"%s\" %s", branchA, info->hash);
+                wide_to_utf8(branchName, branchA, sizeof(branchA));
                 append_output_line(state, TEXT("[分支] 正在创建新分支..."));
-                if (git_execute(state->repo_path, cmdLine, output, MAX_OUTPUT_SIZE) == 0) {
+                if (git_create_branch(state->repo_path, branchA, info->hash, NULL, 0) == 0) {
                     append_output_line(state, TEXT("[成功] 已创建并切换到新分支"));
                     refresh_branch_info(state);
                     refresh_file_list(state);
@@ -1242,9 +1157,9 @@ void on_log_list_context_menu(AppState* state, POINT pt) {
         case IDM_LOG_VIEW_REFLOG: {
             char* reflogOutput = (char*)malloc(MAX_OUTPUT_SIZE);
             if (!reflogOutput) break;
-            memset(reflogOutput, 0, MAX_OUTPUT_SIZE);
+            reflogOutput[0] = '\0';
             append_output_line(state, TEXT("[操作记录] 正在加载 reflog..."));
-            if (git_execute(state->repo_path, "reflog --pretty=format:\"%h  %gs\"", reflogOutput, MAX_OUTPUT_SIZE) == 0) {
+            if (git_reflog(state->repo_path, reflogOutput, MAX_OUTPUT_SIZE) == 0) {
                 char* line = strtok(reflogOutput, "\n");
                 while (line) {
                     TCHAR wline[1024];

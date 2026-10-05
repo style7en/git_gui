@@ -30,7 +30,7 @@ icon.res: icon.rc git-gui.ico
 
 # 清理
 clean:
-	-$(DEL) *.o $(TARGET) icon.res 2>nul || true
+	-rm -f *.o $(TARGET) icon.res
 
 # 重新编译
 rebuild: clean all

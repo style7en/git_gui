@@ -30,14 +30,10 @@ AppState g_appState;
 #define STATUSBAR_HEIGHT 25
 #define TAB_HEIGHT      30
 
-HWND g_hBtnSelectRepo = NULL;
-HWND g_hBtnRefresh = NULL;
-HWND g_hBtnPush = NULL;
-HWND g_hBtnPull = NULL;
-HWND g_hBtnSettings = NULL;
-
 static int g_toolbarH = 40;
 static HFONT g_hMainFont = NULL;
+// 右侧操作按钮宽度（创建时按文字测量，Resize 时复用，避免宽度不一致）
+static int g_rightBtnW[3] = { 0, 0, 0 };
 
 // 前向声明
 void InitListViewColumns(HWND hList, int type);
@@ -87,11 +83,11 @@ void CreateControls(HWND hWnd) {
         HWND phwnd;
         int id;
     } topBtns[] = {
-        { TEXT("选择仓库"), g_hBtnSelectRepo, ID_BTN_SELECT_REPO },
-        { TEXT("刷新"),     g_hBtnRefresh,     ID_BTN_REFRESH },
-        { TEXT("推送"),     g_hBtnPush,        ID_BTN_PUSH },
-        { TEXT("拉取"),     g_hBtnPull,        ID_BTN_PULL },
-        { TEXT("设置"),     g_hBtnSettings,    ID_BTN_SETTINGS },
+        { TEXT("选择仓库"), NULL, ID_BTN_SELECT_REPO },
+        { TEXT("刷新"),     NULL, ID_BTN_REFRESH },
+        { TEXT("推送"),     NULL, ID_BTN_PUSH },
+        { TEXT("拉取"),     NULL, ID_BTN_PULL },
+        { TEXT("设置"),     NULL, ID_BTN_SETTINGS },
     };
     int n = sizeof(topBtns) / sizeof(topBtns[0]);
     int totalW = 0;
@@ -108,12 +104,6 @@ void CreateControls(HWND hWnd) {
         SendMessage(topBtns[i].phwnd, WM_SETFONT, (WPARAM)hFont, TRUE);
         btnX += w + btnGap;
     }
-
-    g_hBtnSelectRepo = topBtns[0].phwnd;
-    g_hBtnRefresh = topBtns[1].phwnd;
-    g_hBtnPush = topBtns[2].phwnd;
-    g_hBtnPull = topBtns[3].phwnd;
-    g_hBtnSettings = topBtns[4].phwnd;
 
     int toolbarH = btnY + btnH + 5;
     g_toolbarH = toolbarH;
@@ -169,9 +159,9 @@ void CreateControls(HWND hWnd) {
         { TEXT("提交更改"),   NULL, ID_BTN_COMMIT_NOW },
     };
     int nr = sizeof(rightBtns) / sizeof(rightBtns[0]);
-    int rBtnW[3], rBtnGap = 8;
+    int rBtnGap = 8;
     for (int i = 0; i < nr; i++) {
-        rBtnW[i] = BtnWidth(hdc, rightBtns[i].text);
+        g_rightBtnW[i] = BtnWidth(hdc, rightBtns[i].text);
     }
 
     int rBtnY = contentTop + 120;
@@ -179,9 +169,9 @@ void CreateControls(HWND hWnd) {
     for (int i = 0; i < nr; i++) {
         rightBtns[i].phwnd = CreateWindowEx(0, TEXT("BUTTON"), rightBtns[i].text,
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            rBtnX, rBtnY, rBtnW[i], 28, hWnd, (HMENU)(INT_PTR)rightBtns[i].id, NULL, NULL);
+            rBtnX, rBtnY, g_rightBtnW[i], 28, hWnd, (HMENU)(INT_PTR)rightBtns[i].id, NULL, NULL);
         SendMessage(rightBtns[i].phwnd, WM_SETFONT, (WPARAM)hFont, TRUE);
-        rBtnX += rBtnW[i] + rBtnGap;
+        rBtnX += g_rightBtnW[i] + rBtnGap;
     }
 
     g_appState.hBtnStage = rightBtns[0].phwnd;
@@ -312,16 +302,14 @@ void ResizeControls(HWND hWnd) {
             SWP_NOZORDER);
     }
 
-    if (g_appState.hBtnStage) {
-        SetWindowPos(g_appState.hBtnStage, NULL, rightX, contentTop + 120, 80, 28, SWP_NOZORDER);
-    }
-
-    if (g_appState.hBtnStageAll) {
-        SetWindowPos(g_appState.hBtnStageAll, NULL, rightX + 85, contentTop + 120, 80, 28, SWP_NOZORDER);
-    }
-
-    if (g_appState.hBtnCommitNow) {
-        SetWindowPos(g_appState.hBtnCommitNow, NULL, rightX + 170, contentTop + 120, 80, 28, SWP_NOZORDER);
+    // 右侧三个操作按钮：使用创建时测量的宽度，保持与 CreateControls 一致
+    HWND rightBtns[3] = { g_appState.hBtnStage, g_appState.hBtnStageAll, g_appState.hBtnCommitNow };
+    int rBtnX = rightX;
+    for (int i = 0; i < 3; i++) {
+        if (rightBtns[i]) {
+            SetWindowPos(rightBtns[i], NULL, rBtnX, contentTop + 120, g_rightBtnW[i], 28, SWP_NOZORDER);
+            rBtnX += g_rightBtnW[i] + 8;
+        }
     }
 
     if (g_appState.hLabelOutput) {
@@ -374,8 +362,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
             app_state_init(&g_appState);
             g_appState.hMainWnd = hWnd;
-            strncpy(g_git_path, g_appState.git_path, MAX_PATH_LEN - 1);
-            g_git_path[MAX_PATH_LEN - 1] = '\0';
+            git_set_git_path(g_appState.git_path);
 
             CreateControls(hWnd);
 
@@ -425,8 +412,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
                 case ID_BTN_SETTINGS:
                     on_settings_clicked(&g_appState);
-                    strncpy(g_git_path, g_appState.git_path, MAX_PATH_LEN - 1);
-                    g_git_path[MAX_PATH_LEN - 1] = '\0';
+                    git_set_git_path(g_appState.git_path);
                     break;
 
                 case IDM_FILE_EXIT:
@@ -493,13 +479,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    (void)hPrevInstance;
+    (void)lpCmdLine;
+
     // 启用 System DPI 感知，让 Windows 自动缩放整个程序（等同于"系统增强"效果）
     // 使用 GDI 缩放模式，字体清晰且布局正确
     typedef DPI_AWARENESS_CONTEXT (WINAPI *SetProcessDpiAwarenessContext_t)(DPI_AWARENESS_CONTEXT);
     HMODULE hUser32 = GetModuleHandle(TEXT("user32.dll"));
     if (hUser32) {
-        SetProcessDpiAwarenessContext_t pSetProcessDpiAwarenessContext = 
-            (SetProcessDpiAwarenessContext_t)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
+        // 经 void* 中转，避免 FARPROC 到函数指针的直接转换告警
+        SetProcessDpiAwarenessContext_t pSetProcessDpiAwarenessContext =
+            (SetProcessDpiAwarenessContext_t)(void*)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
         if (pSetProcessDpiAwarenessContext) {
             // DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED = ((DPI_AWARENESS_CONTEXT)-5)
             // 效果等同于兼容性设置中的"系统增强"
@@ -507,15 +497,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         } else {
             // Windows 8.1+ 兼容方案
             typedef BOOL (WINAPI *SetProcessDpiAwareness_t)(int);
-            SetProcessDpiAwareness_t pSetProcessDpiAwareness = 
-                (SetProcessDpiAwareness_t)GetProcAddress(hUser32, "SetProcessDpiAwareness");
+            SetProcessDpiAwareness_t pSetProcessDpiAwareness =
+                (SetProcessDpiAwareness_t)(void*)GetProcAddress(hUser32, "SetProcessDpiAwareness");
             if (pSetProcessDpiAwareness) {
                 pSetProcessDpiAwareness(1); // PROCESS_SYSTEM_DPI_AWARE
             } else {
                 // Windows Vista/7 兼容方案
                 typedef BOOL (WINAPI *SetProcessDPIAware_t)(void);
-                SetProcessDPIAware_t pSetProcessDPIAware = 
-                    (SetProcessDPIAware_t)GetProcAddress(hUser32, "SetProcessDPIAware");
+                SetProcessDPIAware_t pSetProcessDPIAware =
+                    (SetProcessDPIAware_t)(void*)GetProcAddress(hUser32, "SetProcessDPIAware");
                 if (pSetProcessDPIAware) {
                     pSetProcessDPIAware();
                 }
@@ -533,12 +523,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wcex.cbClsExtra = 0;
     wcex.cbWndExtra = 0;
     wcex.hInstance = hInstance;
-    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(101));
+    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APPICON));
     wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
     wcex.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wcex.lpszMenuName = NULL;
     wcex.lpszClassName = TEXT("GitGUIClass");
-    wcex.hIconSm = (HICON)LoadImage(hInstance, MAKEINTRESOURCE(101), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+    wcex.hIconSm = (HICON)LoadImage(hInstance, MAKEINTRESOURCE(IDI_APPICON), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
 
     if (!RegisterClassEx(&wcex)) {
         MessageBox(NULL, TEXT("窗口类注册失败"), TEXT("错误"), MB_ICONERROR);
